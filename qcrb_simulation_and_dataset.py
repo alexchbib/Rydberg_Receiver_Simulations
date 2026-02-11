@@ -54,6 +54,12 @@ CG_CP_M = 1 / np.sqrt(2)
 
 
 def alpha_pol(theta, q):
+    """
+    Polarization projection coefficient alpha_q(theta).
+
+    Maps RF polarization angle to spherical-basis component weight:
+      q=+1 (sigma+), q=-1 (sigma-), q=0 (pi).
+    """
     if q == +1:
         return -1 / np.sqrt(2) * np.sin(theta)
     if q == -1:
@@ -64,19 +70,36 @@ def alpha_pol(theta, q):
 
 
 def omega_rf_components(theta_rf, theta_b, e0, b_field, omega_rf):
+    """
+    Build per-transition RF coupling data for the Zeeman-resolved model.
+
+    Returns list of tuples:
+      (Omega_q, Delta_q, mJp, mJ)
+    where each entry corresponds to one transition path in `TRANSITIONS`.
+    """
     components = []
     for tr in TRANSITIONS:
+        # Zeeman shift projected along bias-field direction.
         delta_z = (G_P * tr["mJ"] - G_S * tr["mJp"]) * MU_B * b_field * np.cos(theta_b) / HBAR
+        # Effective detuning for this path.
         delta_q = omega_rf - (OMEGA_0 + delta_z)
+        # RF Rabi amplitude for this path, including angular and CG factors.
         omega_q = (e0 / HBAR) * abs(alpha_pol(theta_rf, tr["q"]) * tr["phase"] * tr["CG"] * D_REDUCED)
         components.append((omega_q, delta_q, tr["mJp"], tr["mJ"]))
     return components
 
 
 def h_system(theta_rf, theta_b, e0, b_field, omega_rf=OMEGA_RF_DEFAULT):
+    """
+    Construct the full 6-level Hamiltonian:
+      H = H_probe + H_coupling + H_rf + H_detuning
+    """
+    # Probe drives g <-> e.
     h_p = (OMEGA_P / 2) * (SIG_GE + SIG_EG)
+    # Coupling laser drives e <-> r+/- channels.
     h_c = (OMEGA_C / 2) * (CG_CP_P * (SIG_ERP + SIG_RPE) + CG_CP_M * (SIG_ERM + SIG_RME))
 
+    # RF term: sum all Zeeman-resolved r <-> p transitions.
     h_rf = Qobj(np.zeros((6, 6), dtype=complex))
     for omega_q, _, m_jp, m_j in omega_rf_components(theta_rf, theta_b, e0, b_field, omega_rf):
         idx_r = "r+" if m_jp == +0.5 else "r-"
@@ -84,6 +107,7 @@ def h_system(theta_rf, theta_b, e0, b_field, omega_rf=OMEGA_RF_DEFAULT):
         op_rp = STATES[idx_r] * STATES[idx_p].dag()
         h_rf += (omega_q / 2) * (op_rp + op_rp.dag())
 
+    # Diagonal detuning shifts for excited and p-sublevels.
     h_det = DELTA_P * PROJ["e"] + DELTA_C * (PROJ["r+"] + PROJ["r-"])
     for _, delta_q, _, m_j in omega_rf_components(theta_rf, theta_b, e0, b_field, omega_rf):
         key = "p+" if m_j == +0.5 else "p-"
@@ -93,6 +117,10 @@ def h_system(theta_rf, theta_b, e0, b_field, omega_rf=OMEGA_RF_DEFAULT):
 
 
 def collapse_operators():
+    """
+    Dissipative channels used by the Lindblad master equation.
+    Includes population decay and pure dephasing on p sublevels.
+    """
     return [
         np.sqrt(GAMMA2) * SIG_GE,
         np.sqrt(GAMMA3) * (SIG_RPE + SIG_RME),
@@ -103,15 +131,22 @@ def collapse_operators():
 
 
 def rho_ss(theta_rf, theta_b, e0, b_field, omega_rf=OMEGA_RF_DEFAULT):
+    """Solve steady-state density matrix for given field/angle parameters."""
     return steadystate(h_system(theta_rf, theta_b, e0, b_field, omega_rf), collapse_operators())
 
 
 def compute_qfi(theta_rf, theta_b, e0, b_field, eps=1e-5, omega_rf=OMEGA_RF_DEFAULT):
+    """
+    Compute QFI for theta_rf using central finite difference and mixed-state formula.
+    """
+    # Baseline and +/- perturbation states.
     rho0 = rho_ss(theta_rf, theta_b, e0, b_field, omega_rf)
     rho_p = rho_ss(theta_rf + eps, theta_b, e0, b_field, omega_rf)
     rho_m = rho_ss(theta_rf - eps, theta_b, e0, b_field, omega_rf)
+    # Numerical derivative d(rho)/d(theta_rf).
     drho = (rho_p - rho_m) / (2 * eps)
 
+    # Build linear system from Safranek-style QFI expression in vectorized form.
     vec = lambda a: a.full().ravel(order="F")
     mat = np.kron(rho0.full().conj(), np.eye(6)) + np.kron(np.eye(6), rho0.full())
     mat_inv = np.linalg.inv(mat + 1e-12 * np.eye(36))
@@ -122,7 +157,7 @@ def compute_qfi(theta_rf, theta_b, e0, b_field, eps=1e-5, omega_rf=OMEGA_RF_DEFA
 def _pad_density_matrix_to_power_of_two(rho_array):
     # PennyLane qubit density matrices require 2^n dimensions.
     # The demo model is 6-level (6x6), so we optionally embed it into 8x8.
-    dim = rho_array.shape[0]
+    dim = rho_array.shape[0] 
     target_dim = 1 << int(np.ceil(np.log2(dim)))
     if target_dim == dim:
         return rho_array
@@ -158,6 +193,9 @@ def to_pennylane_density_matrix(rho, atol=1e-8, mode="pad"):
 
 
 def sweep_resolution_vs_e0(theta_rf_deg=30.0, theta_b_deg=30.0, b_field=0.2e-4, nu=1e4):
+    """
+    Sweep electric-field amplitude and compute CRB-style angular resolution curve.
+    """
     theta_rf = np.deg2rad(theta_rf_deg)
     theta_b = np.deg2rad(theta_b_deg)
     e0_values = np.logspace(-3, 0, 500)
@@ -165,6 +203,7 @@ def sweep_resolution_vs_e0(theta_rf_deg=30.0, theta_b_deg=30.0, b_field=0.2e-4, 
     qfi_cut = 5e-3
 
     for i, e0 in enumerate(e0_values):
+        # QFI is converted to resolution: delta_theta ~ sqrt(1 / (nu * F)).
         f_val = compute_qfi(theta_rf, theta_b, e0=e0, b_field=b_field, eps=1e-5)
         res[i] = np.nan if f_val < qfi_cut else np.degrees(np.sqrt(1.0 / (nu * f_val)))
 
@@ -172,6 +211,9 @@ def sweep_resolution_vs_e0(theta_rf_deg=30.0, theta_b_deg=30.0, b_field=0.2e-4, 
 
 
 def sweep_resolution_vs_b(theta_rf_deg=30.0, theta_b_deg=30.0, e0=0.1, nu=1e4):
+    """
+    Sweep magnetic-field magnitude and compute CRB-style angular resolution curve.
+    """
     theta_rf = np.deg2rad(theta_rf_deg)
     theta_b = np.deg2rad(theta_b_deg)
     b_values = np.logspace(-5, -2, 100)
@@ -185,16 +227,25 @@ def sweep_resolution_vs_b(theta_rf_deg=30.0, theta_b_deg=30.0, e0=0.1, nu=1e4):
 
 
 def generate_dataset(n_samples=500, seed=42):
+    """
+    Generate raw simulation dataset from the 6-level model.
+
+    Returns:
+      - x: complex density matrices with shape (N, 6, 6)
+      - y: target angle theta_rf in radians with shape (N,)
+    """
     rng = np.random.default_rng(seed)
     x = np.zeros((n_samples, 6, 6), dtype=np.complex128)
     y = np.zeros((n_samples,), dtype=np.float64)
 
     for i in range(n_samples):
+        # Sample label and nuisance parameters.
         theta_rf = rng.uniform(0.0, np.pi / 2)
         theta_b = rng.uniform(0.0, np.pi / 2)
         e0 = rng.uniform(1e-3, 1.0)
         b_field = 10 ** rng.uniform(-5, -2)
 
+        # Run simulation and store full density matrix.
         rho = rho_ss(theta_rf, theta_b, e0=e0, b_field=b_field)
         x[i] = rho.full()
         y[i] = theta_rf
@@ -203,6 +254,11 @@ def generate_dataset(n_samples=500, seed=42):
 
 
 def generate_pennylane_dataset(n_samples=500, seed=42, conversion_mode="pad"):
+    """
+    Generate dataset converted to PennyLane-compatible qubit density matrices.
+
+    In "pad" mode, 6x6 states are embedded into 8x8 before conversion.
+    """
     rng = np.random.default_rng(seed)
 
     # Probe one sample first to allocate output tensors with the converted size
@@ -215,11 +271,13 @@ def generate_pennylane_dataset(n_samples=500, seed=42, conversion_mode="pad"):
     y = np.zeros((n_samples,), dtype=np.float64)
 
     for i in range(n_samples):
+        # Draw one randomized operating point.
         theta_rf = rng.uniform(0.0, np.pi / 2)
         theta_b = rng.uniform(0.0, np.pi / 2)
         e0 = rng.uniform(1e-3, 1.0)
         b_field = 10 ** rng.uniform(-5, -2)
 
+        # Simulate then convert to qubit-sized density matrix.
         rho = rho_ss(theta_rf, theta_b, e0=e0, b_field=b_field)
         rho_pl, _ = to_pennylane_density_matrix(rho, mode=conversion_mode)
         x[i] = rho_pl
