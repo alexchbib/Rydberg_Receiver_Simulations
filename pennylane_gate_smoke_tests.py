@@ -35,7 +35,7 @@ def apply_basic_gates(rho, n_qubits):
     # `default.mixed` supports density-matrix evolution.
     dev = qml.device("default.mixed", wires=n_qubits)
 
-    @qml.qnode(dev)
+    @qml.qnode(dev)  #converts function into quantum circuit
     def circuit():
         # Initialize device with externally generated density matrix.
         qml.QubitDensityMatrix(rho, wires=range(n_qubits))
